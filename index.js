@@ -2,14 +2,22 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv").config();
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const admin = require("firebase-admin");
 
 const stripe = require("stripe")(process.env.PAYMENT_GATEWAY_KEY);
 
 const app = express();
 const port = process.env.PORT || 5000;
 
+// Middlewares
 app.use(cors());
 app.use(express.json());
+
+const serviceAccount = require("./firebase-admin-key.json");
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
 
 // --------------------------------------------------------------
 
@@ -34,11 +42,54 @@ async function run() {
     const usersCollection = db.collection("users");
     const paymentsCollection = db.collection("payments");
     const trackingCollection = db.collection("tracking");
+    const ridersCollection = db.collection("riders");
+
+    //--------------------Middle Ware Starts---------------------------
+
+    const verifyFBToken = async (req, res, next) => {
+      const authHeader = req.headers.authorization;
+
+      if (!authHeader) {
+        return res.status(401).send({ message: "Unauthorized Access" });
+      }
+
+      const token = authHeader.split(" ")[1];
+      if (!token) {
+        return res.status(401).send({ message: "Unauthorized Access" });
+      }
+
+      // verify the token
+      try {
+        const decoded = await admin.auth().verifyIdToken(token);
+        req.decoded = decoded;
+        next();
+      } catch (error) {
+        return res.status(403).send({ message: "Forbidden Access" });
+      }
+    };
+
+    //--------------------Middle Ware Ends---------------------------
+
     //--------------------API Starts---------------------------
 
-    app.get("/parcels", async (req, res) => {
+    app.post("/users", async (req, res) => {
+      const email = req.body.email;
+
+      const userExists = await usersCollection.findOne({ email });
+      if (userExists) {
+        // update last login time
+        return res.send({ message: "User already exists" });
+      }
+
+      const user = req.body;
+      const result = await usersCollection.insertOne(user);
+      res.send(result);
+    });
+
+    app.get("/parcels", verifyFBToken, async (req, res) => {
       try {
         const userEmail = req.query.email;
+        // console.log(req.headers);
         const query = userEmail
           ? {
               created_by: userEmail,
@@ -124,7 +175,7 @@ async function run() {
             $set: {
               payment_status: "paid",
             },
-          }
+          },
         );
 
         if (updateResult.modifiedCount === 0) {
@@ -156,9 +207,16 @@ async function run() {
       }
     });
 
-    app.get("/payments", async (req, res) => {
+    app.get("/payments", verifyFBToken, async (req, res) => {
+      // console.log("headers in payments", req.headers);
+
       try {
         const userEmail = req.query.email;
+
+        console.log("decoded: ", req.decoded);
+        if (req.decoded.email !== userEmail) {
+          return res.status(403).send({ message: "Forbidden Access" });
+        }
 
         const query = userEmail ? { email: userEmail } : {};
         const options = { sort: { paid_at: -1 } }; // Latest first
@@ -170,6 +228,56 @@ async function run() {
       } catch (error) {
         console.error("Error fetching payment history:", error);
         res.status(500).send({ message: "Failed to get payments" });
+      }
+    });
+
+    app.post("/riders", async (req, res) => {
+      const newRider = req.body;
+      const result = await ridersCollection.insertOne(newRider);
+      res.send(result);
+    });
+
+    app.post("/riders", async (req, res) => {
+      const rider = req.body;
+      const result = await ridersCollection.insertOne(rider);
+      res.send(result);
+    });
+
+    app.get("/riders/pending", async (req, res) => {
+      try {
+        const pendingRiders = await ridersCollection
+          .find({ status: "pending" })
+          .toArray();
+
+        res.send(pendingRiders);
+      } catch (error) {
+        console.error("Failed to load pending riders:", error);
+        res.status(500).send({ message: "Failed to load pending riders" });
+      }
+    });
+
+    app.get("/riders/active", async (req, res) => {
+      const result = await ridersCollection
+        .find({ status: "active" })
+        .toArray();
+      res.send(result);
+    });
+
+    app.patch("/riders/:id/status", async (req, res) => {
+      const { id } = req.params;
+      const { status } = req.body;
+      const query = { _id: new ObjectId(id) };
+      const updateDoc = {
+        $set: {
+          status,
+        },
+      };
+
+      try {
+        const result = await ridersCollection.updateOne(query, updateDoc);
+        res.send(result);
+      } catch (err) {
+        res.status(500).send({ message: "Failed to update rider status" });
       }
     });
 
@@ -200,7 +308,7 @@ async function run() {
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!"
+      "Pinged your deployment. You successfully connected to MongoDB!",
     );
   } finally {
     // Ensures that the client will close when you finish/error
